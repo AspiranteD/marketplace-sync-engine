@@ -1,4 +1,5 @@
-# Marketplace Sync Engine
+﻿# Marketplace Sync Engine
+> **Portfolio context:** Extracted from founder-led production systems — multi-marketplace inventory, orders, and warehouse execution. **[Full portfolio](https://github.com/AspiranteD)** · [aspiranted.github.io](https://aspiranted.github.io)
 
 Production-grade orchestration engine for multi-marketplace data synchronization. Manages extraction scheduling, feed generation with intelligent deduplication, and batch database writes across marketplace platforms.
 
