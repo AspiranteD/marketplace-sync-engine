@@ -1,97 +1,175 @@
 """
-Quick demo: wire up the sync engine with in-memory adapters and run a full sync.
+Example: configuring and running the full sync engine.
 
-Usage:
-    python -m examples.sync_demo
+Shows how to:
+  1. Register extraction jobs with custom intervals
+  2. Use callbacks for account validation and zombie detection
+  3. Run the startup sequence
+  4. Configure feed sync with deduplication and store assignment
+  5. Use ThreadManager for batch DB writes
 """
-
-from __future__ import annotations
-
-from src.sync.sync_engine import ListingData, SyncEngine
-from src.sync.state_machine import ListingStateMachine, ListingEvent
-from src.sync.conflict_resolver import ConflictResolver, ListingSnapshot, ResolutionStrategy
+from src.scheduler.scheduler import ExtractionScheduler, JobConfig
+from src.scheduler.api import SchedulerAPI, IntervalUpdateRequest
+from src.sync.feed_sync import FeedSyncService
+from src.worker.thread_manager import ThreadManager
 
 
-# ---------------------------------------------------------------------------
-# 1. In-memory platform adapter
-# ---------------------------------------------------------------------------
+def demo_scheduler():
+    """Configure and control the extraction scheduler."""
 
-class MemoryAdapter:
-    def __init__(self, name: str, listings: dict[str, ListingData] | None = None):
-        self._name = name
-        self._store: dict[str, ListingData] = listings or {}
+    def validate_accounts():
+        return {"all_valid": True, "results": [{"valid": True}]}
 
-    @property
-    def platform_name(self) -> str:
-        return self._name
+    def check_running(ext_type):
+        return False
 
-    def fetch_listing(self, listing_id: str) -> ListingData | None:
-        return self._store.get(listing_id)
+    def mark_zombie(ext_type, timeout_min):
+        return []
 
-    def push_listing(self, listing: ListingData) -> bool:
-        self._store[listing.listing_id] = listing
-        print(f"  [{self._name}] pushed {listing.listing_id} @ €{listing.price}")
-        return True
+    scheduler = ExtractionScheduler(
+        validate_accounts=validate_accounts,
+        check_running=check_running,
+        mark_zombie=mark_zombie,
+    )
 
-    def push_price(self, listing_id: str, price: float) -> bool:
-        if listing_id in self._store:
-            self._store[listing_id].price = price
-        return True
+    scheduler.register_job(JobConfig(
+        job_id="extract_orders", name="Orders",
+        run_fn=lambda: print("Extracting orders..."),
+        interval_minutes=30,
+        requires_valid_accounts=True,
+        run_on_startup=True,
+    ))
 
-    def list_ids(self) -> list[str]:
-        return list(self._store.keys())
+    scheduler.register_job(JobConfig(
+        job_id="extract_chats", name="Chats",
+        run_fn=lambda: print("Extracting chats..."),
+        interval_hours=4,
+        requires_valid_accounts=True,
+        run_on_startup=True,
+    ))
+
+    scheduler.register_job(JobConfig(
+        job_id="ebay_relist", name="eBay Relist",
+        run_fn=lambda: print("Running eBay relist..."),
+        interval_hours=72,
+        misfire_grace_time=3600,
+        requires_valid_accounts=False,
+        run_on_startup=False,
+    ))
+
+    # REST API wrapper
+    api = SchedulerAPI(scheduler)
+
+    print("Status:", api.get_status())
+    print("Start:", api.start())
+    print("Run job:", api.run_job("extract_orders"))
+    print("Set interval:", api.set_interval(
+        "extract_orders", IntervalUpdateRequest(hours=1, minutes=0),
+    ))
+    print("Jobs:", api.list_jobs())
+    print("Stop:", api.stop())
+
+    # Startup sequence (validates accounts, runs startup jobs)
+    scheduler.start()
+    scheduler.run_startup_sequence()
+
+    # Watchdog (detects zombies)
+    scheduler.run_watchdog()
 
 
-# ---------------------------------------------------------------------------
-# 2. Build adapters with sample data
-# ---------------------------------------------------------------------------
+def demo_feed_sync():
+    """Configure and run feed sync with deduplication."""
 
-wallapop = MemoryAdapter("wallapop", {
-    "WLP-001": ListingData("WLP-001", "iPhone 13 128 GB", 420.0, "active", "wallapop", updated_at=1000),
-    "WLP-002": ListingData("WLP-002", "MacBook Air M2", 890.0, "active", "wallapop", updated_at=1000),
-    "WLP-003": ListingData("WLP-003", "AirPods Pro", 120.0, "active", "wallapop", updated_at=1000),
-})
+    def load_feed():
+        return [
+            {
+                "id_base": "LPNWE001",
+                "asin": "B08N5WRWNW",
+                "price": 45.99,
+                "external_category": "Electronics",
+                "condition_code": "PERFECTO",
+                "condition_description": "PAOLA",
+                "images_raw": "https://img1.jpg, https://img2.jpg",
+                "shipping_weight_kg": 2.5,
+                "title": "Wireless Headphones",
+            },
+            {
+                "id_base": "LPNWE002",
+                "asin": "B08N5WRWNW",
+                "price": 42.50,
+                "external_category": "Electronics",
+                "condition_code": "PERFECTO",
+                "condition_description": "BN",
+                "images_raw": "https://img3.jpg",
+                "shipping_weight_kg": 2.5,
+                "title": "Wireless Headphones",
+            },
+            {
+                "id_base": "LPNWE003",
+                "asin": "B08N5WRWNW",
+                "price": 30.00,
+                "external_category": "Electronics",
+                "condition_code": "CON_TARA",
+                "condition_description": "Scratched left ear cup",
+                "images_raw": "https://img4.jpg",
+                "shipping_weight_kg": 2.5,
+                "title": "Wireless Headphones (defect)",
+            },
+        ]
 
-ebay = MemoryAdapter("ebay")
-portalhero = MemoryAdapter("portalhero")
+    uploaded_data = []
 
-# ---------------------------------------------------------------------------
-# 3. State machine demo
-# ---------------------------------------------------------------------------
+    def upload_file(filename, items):
+        uploaded_data.extend(items)
+        print(f"Uploaded {filename}: {len(items)} items")
 
-print("=== State Machine ===")
-sm = ListingStateMachine()
-print(f"  State: {sm.state.value}")
-sm.transition(ListingEvent.PUBLISH)
-print(f"  -> PUBLISH -> {sm.state.value}")
-sm.transition(ListingEvent.RESERVE)
-print(f"  -> RESERVE -> {sm.state.value}")
-sm.transition(ListingEvent.SELL)
-print(f"  -> SELL    -> {sm.state.value}")
-sm.transition(ListingEvent.COMPLETE)
-print(f"  -> COMPLETE-> {sm.state.value}")
-print()
+    svc = FeedSyncService(
+        load_feed=load_feed,
+        upload_file=upload_file,
+        top_n_expensive=2,
+    )
 
-# ---------------------------------------------------------------------------
-# 4. Sync engine demo
-# ---------------------------------------------------------------------------
+    result = svc.sync()
+    print(f"Sync result: {result}")
 
-print("=== Full Sync ===")
-engine = SyncEngine(wallapop, [ebay, portalhero])
-stats = engine.sync_all()
-print(f"\n  Stats: synced={stats.synced}  skipped={stats.skipped}  failed={stats.failed}  conflicts={stats.conflicts}")
-print()
+    for item in uploaded_data:
+        print(f"  {item['id']}: stock={item.get('stock', 1)}, "
+              f"price={item.get('price')}, store={item.get('store')}")
 
-# ---------------------------------------------------------------------------
-# 5. Conflict resolution demo
-# ---------------------------------------------------------------------------
 
-print("=== Conflict Resolution ===")
-local = ListingSnapshot("WLP-001", price=420.0, status="active", updated_at=1000, platform="wallapop")
-remote = ListingSnapshot("WLP-001", price=399.0, status="active", updated_at=1050, platform="ebay")
+def demo_thread_manager():
+    """Configure batch writer with passthrough and active modes."""
 
-resolver = ConflictResolver()
-result = resolver.resolve(local, remote, ResolutionStrategy.LAST_WRITE_WINS)
-print(f"  Strategy: {result.strategy.value}")
-print(f"  Winner:   {result.chosen.platform} @ €{result.chosen.price}")
-print(f"  Reason:   {result.reason}")
+    # Passthrough mode (default) - no-op
+    tm_passive = ThreadManager(enabled=False)
+    tm_passive.enqueue("create", {"id": 1})
+    print("Passthrough: queue empty =", tm_passive.task_queue.empty())
+
+    # Active mode with batch processing
+    results = []
+    tm = ThreadManager(batch_size=2, enabled=True)
+    tm.set_callback("batch_create", lambda items: results.extend(items))
+    tm.start_writer()
+
+    for i in range(5):
+        tm.enqueue("create", {"id": i}, use_buffer=True)
+
+    tm.stop_writer()
+    print(f"Batch processed: {len(results)} items")
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Scheduler Demo")
+    print("=" * 60)
+    demo_scheduler()
+
+    print("\n" + "=" * 60)
+    print("Feed Sync Demo")
+    print("=" * 60)
+    demo_feed_sync()
+
+    print("\n" + "=" * 60)
+    print("Thread Manager Demo")
+    print("=" * 60)
+    demo_thread_manager()

@@ -1,171 +1,145 @@
 # Marketplace Sync Engine
 
-![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
-![APScheduler](https://img.shields.io/badge/APScheduler-3.10+-green)
-![Tests](https://img.shields.io/badge/tests-pytest-blue?logo=pytest)
-![License](https://img.shields.io/badge/license-MIT-brightgreen)
-
-Multi-platform listing synchronization engine with **job scheduling**, **state-machine lifecycle management**, **cross-platform conflict resolution**, and **health-monitoring watchdog**.
-
-Built as a reusable backbone for marketplace automation across Wallapop, eBay, PortalHero, and similar platforms.
-
----
-
-## Features
-
-| Module | Description |
-|---|---|
-| **Scheduler** | APScheduler wrapper with named job registry, duplicate prevention, and pause/resume |
-| **Sync Engine** | Primary → secondary orchestrator with batching and platform adapter protocol |
-| **State Machine** | Listing lifecycle (Draft → Active → Sold → Completed) with validated transitions |
-| **Conflict Resolver** | Detects price/status mismatches; strategies: *Last-Write-Wins*, *Primary-Wins*, *Manual-Review* |
-| **Health Monitor** | Watchdog that detects stalled jobs, missed schedules, and auto-restarts crashed workers |
-| **Thread Pool** | Managed `ThreadPoolExecutor` with task tracking, stats, and graceful shutdown |
-
----
+Production-grade orchestration engine for multi-marketplace data synchronization. Manages extraction scheduling, feed generation with intelligent deduplication, and batch database writes across marketplace platforms.
 
 ## Architecture
 
-### Listing State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> Draft
-    Draft --> Active : PUBLISH
-    Active --> Reserved : RESERVE
-    Active --> Sold : SELL
-    Active --> Paused : PAUSE
-    Active --> Banned : BAN
-    Active --> Expired : EXPIRE
-    Reserved --> Sold : SELL
-    Reserved --> Active : RESUME
-    Sold --> Completed : COMPLETE
-    Paused --> Active : RESUME
-    Banned --> Active : UNBAN
-    Expired --> Active : RELIST
+```
+src/
+├── scheduler/
+│   ├── scheduler.py          # Multi-job scheduler with watchdog
+│   └── api.py                # REST API for scheduler control
+├── sync/
+│   ├── feed_sync.py          # DB -> CSV -> cloud sync pipeline
+│   └── store_assignment.py   # Price-ranked store routing
+└── worker/
+    └── thread_manager.py     # Queue-based batch DB writer
 ```
 
-### Sync Flow
+## Key Technical Features
 
-```mermaid
-flowchart LR
-    subgraph Primary["Primary Platform (Wallapop)"]
-        A[Fetch Listings]
-    end
-    subgraph Engine["Sync Engine"]
-        B[Conflict Check]
-        C[State Validation]
-        D[Batch Processor]
-    end
-    subgraph Secondary["Secondary Platforms"]
-        E[eBay]
-        F[PortalHero]
-    end
-    A --> D --> B --> C
-    C --> E
-    C --> F
-```
+### Extraction Scheduler (`src/scheduler/scheduler.py`)
 
-### Watchdog Loop
+APScheduler-based multi-job orchestration with production safeguards:
 
-```mermaid
-flowchart TD
-    A[Health Monitor] -->|every N seconds| B{Check Jobs}
-    B --> C{Stalled?}
-    B --> D{Missed schedule?}
-    B --> E{Crashed?}
-    C -->|yes| F[Log + Alert]
-    D -->|yes| G[Increment miss counter]
-    E -->|yes| H{Auto-restart?}
-    H -->|yes| I[Restart callback]
-    H -->|no| J[Log issue]
-```
+- **5+ independent jobs** with configurable intervals (orders=30min, chats=4h, listings=4h, eBay relist=72h, dynamic pricing=24h)
+- **Startup sequence**: validate accounts → run startup jobs sequentially (orders → chats → listings)
+- **Zombie detection watchdog**: every 5 min, detects extractions stuck in `running` state beyond per-type timeouts (orders=20min, chats=60min, listings=45min)
+- **Account validation gating**: skip extraction if no valid accounts/cookies
+- **Concurrency protection**: `max_instances=1` + `coalesce=True` prevents overlapping runs
+- **Misfire grace time**: 300s for extractors, 3600s for relist (handles server restarts)
+- **Runtime interval changes**: modify any job's schedule via API without restart
+- **Job status tracking**: run_count, skip_count, last_status, last_error, last_skip_reason
+- **Event listeners**: APScheduler job execution/error events → status updates + DB persistence
+- **Database-agnostic**: callbacks for account validation, running checks, zombie marking
 
----
+### Scheduler REST API (`src/scheduler/api.py`)
 
-## Quick Start
+Full control plane:
+- `GET /scheduler/status` — scheduler state + all jobs status
+- `POST /scheduler/start` / `POST /scheduler/stop`
+- `POST /scheduler/jobs/{id}/run` — execute immediately
+- `PUT /scheduler/jobs/{id}/interval` — change schedule at runtime
+- `GET /scheduler/jobs` — list all with status
+
+Validated inputs (no negative intervals, no zero, minutes 0-59).
+
+### Feed Sync Pipeline (`src/sync/feed_sync.py`)
+
+Full DB → CSV → cloud storage pipeline with 9-step processing:
+
+1. **Price filtering**: minimum 2 EUR, motor category exempt
+2. **Image normalization**: split mixed separators (comma/space/pipe), limit to 10
+3. **Condition mapping**: `PERFECTO` → `as_good_as_new`, `CON_TARA` → `fair`, `PARA_PIEZAS` → `has_given_it_all`
+4. **Shipping rules**: shippable if weight ≤ 30kg or unknown
+5. **Free shipping**: weight < 5kg AND price > 70 EUR
+6. **ASIN+condition deduplication** with stock accumulation:
+   - `PERFECTO`: group by ASIN+condition only (operator notes like "PAOLA", "BN" are not defects)
+   - `CON_TARA`/others: group by ASIN+condition+description (each defect has unique images)
+   - Within group: stock = count, price = min
+7. **ID randomization**: 2-letter suffix rotating every 54h (676 combinations, AA-ZZ)
+8. **Store assignment**: post-dedup price ranking (motor=16, top 5100=17, rest=14)
+9. **Text formatting**: title truncation (60 chars), description truncation (640 chars)
+
+#### ID Randomization Algorithm
+
+Replicates the production V2_5 algorithm for marketplace search positioning:
+- Base date: 2026-01-21 07:00:00
+- Period: 54 hours (~2.25 days)
+- Offset: 102 (first suffix = "DY")
+- 676 combinations cycling through AA-ZZ
+
+### Store Assignment (`src/sync/store_assignment.py`)
+
+Price-based routing with category priority:
+
+| Store | ID | Rule |
+|-------|-----|------|
+| Motor | 16 | Category contains "motor" (case-insensitive) |
+| Expensive | 17 | Top N most expensive non-motor items |
+| Cheap | 14 | Remaining non-motor items |
+
+- Configurable TOP_N threshold (default 5100)
+- Batch recalculation with update tracking (updated vs unchanged)
+- Zero/null price → always cheap
+
+### Thread Manager (`src/worker/thread_manager.py`)
+
+Queue-based batch processing for database writes:
+
+- **Typed message queue**: create, update, batch_create, batch_update, progress, stop
+- **Buffer accumulation**: individual ops buffer until batch_size → auto-flush
+- **Dedicated writer thread**: non-daemon for graceful shutdown
+- **Pluggable callbacks**: per-type handlers for database persistence
+- **Named locks**: hashes, counter, state, cache for synchronized access
+- **Passthrough mode**: when disabled, all operations are no-ops (zero-cost migration)
+- **Graceful shutdown**: flush pending → signal stop → join with 30s timeout
+- **Timeout-based polling**: 0.5s queue wait with periodic buffer checks
+
+## Testing
 
 ```bash
-# Clone
-git clone https://github.com/AspiranteD/marketplace-sync-engine.git
-cd marketplace-sync-engine
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run tests
 python -m pytest tests/ -v
-
-# Run demo
-python -m examples.sync_demo
 ```
 
----
+**160 tests** covering:
+- Scheduler lifecycle (start/stop/double-start, job registration, interval changes)
+- Account validation gating and skip tracking
+- Startup sequence with error isolation
+- Watchdog zombie detection
+- REST API endpoints and input validation
+- Feed sync full pipeline (filter → normalize → map → dedup → assign → format)
+- ASIN deduplication rules (PERFECTO vs CON_TARA grouping)
+- ID randomization algorithm (period boundaries, determinism)
+- Store assignment (motor routing, price ranking, boundary cases)
+- Thread manager (passthrough, enabled, buffers, concurrent enqueue, graceful shutdown)
 
 ## Usage
 
-### Sync Engine with Platform Adapters
-
 ```python
-from src.sync import SyncEngine
+from src.scheduler.scheduler import ExtractionScheduler, JobConfig
+from src.sync.feed_sync import FeedSyncService
 
-engine = SyncEngine(
-    primary=wallapop_adapter,
-    secondaries=[ebay_adapter, portalhero_adapter],
-    batch_size=50,
+# 1. Configure scheduler
+scheduler = ExtractionScheduler(
+    validate_accounts=my_validator,
+    mark_zombie=my_zombie_detector,
 )
-
-stats = engine.sync_all()
-print(f"Synced: {stats.synced}, Conflicts: {stats.conflicts}")
-```
-
-### Listing State Machine
-
-```python
-from src.sync import ListingStateMachine, ListingEvent
-
-sm = ListingStateMachine()       # starts at DRAFT
-sm.transition(ListingEvent.PUBLISH)   # → ACTIVE
-sm.transition(ListingEvent.RESERVE)   # → RESERVED
-sm.transition(ListingEvent.SELL)      # → SOLD
-```
-
-### Job Scheduler
-
-```python
-from src.scheduler import JobScheduler
-
-scheduler = JobScheduler()
-scheduler.add_job("price_sync", engine.sync_prices, "interval", minutes=15)
-scheduler.add_job("full_sync", engine.sync_all, "cron", hour=3)
+scheduler.register_job(JobConfig(
+    job_id="extract_orders", name="Orders",
+    run_fn=my_order_extractor, interval_minutes=30,
+))
 scheduler.start()
+scheduler.run_startup_sequence()
+
+# 2. Configure feed sync
+sync = FeedSyncService(
+    load_feed=my_db_loader,
+    upload_file=my_cloud_uploader,
+    top_n_expensive=5100,
+)
+sync.sync()
 ```
 
----
-
-## Design Decisions
-
-### Why a State Machine for Listings?
-
-Marketplace listings have strict lifecycle rules — you can't sell a draft, you can't pause a completed sale. A state machine makes invalid transitions impossible at the code level, preventing data corruption across platforms.
-
-### Why Primary-Wins as Default Strategy?
-
-In multi-platform selling, one platform is always the "source of truth" (usually where the seller manages inventory). Primary-Wins avoids race conditions where a stale eBay price overwrites a fresh Wallapop update. Last-Write-Wins is available for peer-to-peer sync scenarios.
-
-### Why APScheduler over Celery?
-
-This engine runs as a single-process library, not a distributed system. APScheduler is lightweight, has no broker dependency (no Redis/RabbitMQ), and supports both cron and interval triggers out of the box. Celery would be overkill for this use case.
-
----
-
-## Related Projects
-
-- [wallapop-data-extractors](https://github.com/AspiranteD/wallapop-data-extractors) — Scraping and data extraction from Wallapop
-- [ebay-automation-toolkit](https://github.com/AspiranteD/ebay-automation-toolkit) — eBay listing automation tools
-
----
-
-## License
-
-MIT
+See `examples/sync_demo.py` for a complete working example.
